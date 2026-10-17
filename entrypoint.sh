@@ -114,6 +114,73 @@ else
 fi
 chown frappe:frappe "$STAMP"
 
+# ---------- 4b. One-time restore from a backup in the transfer bucket ----------
+# Runs only when RESTORE_ON_BOOT=1 and the marker file is absent. The marker is written
+# only after a fully successful restore, so a failed attempt is retried on the next boot.
+# Needs: TRANSFER_S3_* (bucket reference variables) and RESTORE_ENCRYPTION_KEY
+# (the old site's encryption_key, set by hand in the Railway dashboard).
+RESTORE_MARKER="$DATA/.restore_done"
+if [ "${RESTORE_ON_BOOT:-0}" = "1" ] && [ ! -f "$RESTORE_MARKER" ]; then
+  : "${RESTORE_ENCRYPTION_KEY:?RESTORE_ENCRYPTION_KEY is required when RESTORE_ON_BOOT=1}"
+  : "${TRANSFER_S3_ENDPOINT:?TRANSFER_S3_ENDPOINT is required for restore}"
+  : "${TRANSFER_S3_BUCKET:?TRANSFER_S3_BUCKET is required for restore}"
+  : "${TRANSFER_S3_KEY:?TRANSFER_S3_KEY is required for restore}"
+  : "${TRANSFER_S3_SECRET:?TRANSFER_S3_SECRET is required for restore}"
+
+  RDIR=/tmp/restore
+  rm -rf "$RDIR"; mkdir -p "$RDIR"
+  log "Restore: downloading backup from bucket prefix '${RESTORE_PREFIX:-restore/}'"
+  RDIR="$RDIR" "$BENCH/env/bin/python" - <<'PY'
+import os, sys
+import boto3
+from botocore.config import Config
+
+bucket = os.environ["TRANSFER_S3_BUCKET"]
+prefix = os.environ.get("RESTORE_PREFIX", "restore/")
+s3 = boto3.client(
+    "s3",
+    endpoint_url=os.environ["TRANSFER_S3_ENDPOINT"],
+    region_name=os.environ.get("TRANSFER_S3_REGION", "auto"),
+    aws_access_key_id=os.environ["TRANSFER_S3_KEY"],
+    aws_secret_access_key=os.environ["TRANSFER_S3_SECRET"],
+    config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+)
+resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+keys = [o["Key"] for o in resp.get("Contents", []) if not o["Key"].endswith("/")]
+if not keys:
+    sys.exit(f"Restore: no objects found under {prefix} in the bucket")
+for key in keys:
+    dest = os.path.join(os.environ["RDIR"], os.path.basename(key))
+    s3.download_file(bucket, key, dest)
+    print(f"[entrypoint] Restore: downloaded {os.path.basename(key)}", flush=True)
+PY
+  chown -R frappe:frappe "$RDIR"
+
+  SQL="$(ls "$RDIR"/*.sql.gz 2>/dev/null | head -1 || true)"
+  PUB="$(ls "$RDIR"/*-files.tar 2>/dev/null | grep -v -- '-private-files.tar' | head -1 || true)"
+  PRIV="$(ls "$RDIR"/*-private-files.tar 2>/dev/null | head -1 || true)"
+  [ -n "$SQL" ] || { log "Restore: no .sql.gz database file found in the bucket"; exit 1; }
+  restore_args=()
+  [ -n "$PUB" ]  && restore_args+=(--with-public-files "$PUB")
+  [ -n "$PRIV" ] && restore_args+=(--with-private-files "$PRIV")
+
+  log "Restore: restoring database and files into $SITE_NAME"
+  bench_ --site "$SITE_NAME" restore "$SQL" "${restore_args[@]}" \
+    --db-root-username root --db-root-password "$DB_ROOT_PASSWORD" --force
+
+  # Saved passwords and API secrets in the restored data are encrypted with the OLD site's key.
+  bench_ --site "$SITE_NAME" set-config encryption_key "$RESTORE_ENCRYPTION_KEY"
+  bench_ --site "$SITE_NAME" set-config host_name "https://$SITE_NAME"
+  log "Restore: running bench migrate"
+  bench_ --site "$SITE_NAME" migrate
+  bench_ --site "$SITE_NAME" clear-cache
+  bench_ --site "$SITE_NAME" enable-scheduler
+
+  touch "$RESTORE_MARKER"; chown frappe:frappe "$RESTORE_MARKER"
+  rm -rf "$RDIR"
+  log "Restore: finished. Administrator now uses the password from the restored backup."
+fi
+
 # ---------- 5. MCP Agent role, user and API key ----------
 if [ -n "${MCP_AGENT_API_KEY:-}" ] && [ -n "${MCP_AGENT_API_SECRET:-}" ]; then
   (cd "$SITES" && runuser -u frappe -- "$BENCH/env/bin/python" /opt/railway/provision_mcp_agent.py)
