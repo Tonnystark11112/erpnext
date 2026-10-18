@@ -150,6 +150,11 @@ if [ "${RESTORE_ON_BOOT:-0}" = "1" ] && [ ! -f "$RESTORE_MARKER" ]; then
 
   RDIR=/tmp/restore
   rm -rf "$RDIR"; mkdir -p "$RDIR"
+  # Frappe v16's environment does not ship boto3 (the S3 client); install it once if missing.
+  if ! "$BENCH/env/bin/python" -c "import boto3" >/dev/null 2>&1; then
+    log "Restore: boto3 not found in the bench environment, installing it"
+    "$BENCH/env/bin/pip" install --quiet --disable-pip-version-check boto3
+  fi
   log "Restore: downloading backup from bucket prefix '${RESTORE_PREFIX:-restore/}'"
   RDIR="$RDIR" "$BENCH/env/bin/python" - <<'PY'
 import os, sys
