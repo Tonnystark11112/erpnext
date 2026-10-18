@@ -89,7 +89,14 @@ CURRENT_VERSIONS="$(bench_ version 2>/dev/null | sort || true)"
 STAMP="$DATA/.app_versions"
 
 if [ -e "$SITES/$SITE_NAME" ] && [ ! -L "$SITES/$SITE_NAME" ]; then
-  log "Unexpected real directory at $SITES/$SITE_NAME; refusing to continue."; exit 1
+  if [ ! -f "$SITE_ON_VOLUME/site_config.json" ]; then
+    # First boot only: a real folder here is the leftover of a failed site creation on a
+    # container that was restarted in place. Nothing on the volume depends on it.
+    log "Removing half-created site folder left by a failed first boot"
+    rm -rf "$SITES/$SITE_NAME"
+  else
+    log "Unexpected real directory at $SITES/$SITE_NAME while the site exists on the volume; refusing to continue."; exit 1
+  fi
 fi
 rm -f "$SITES/$SITE_NAME"
 
