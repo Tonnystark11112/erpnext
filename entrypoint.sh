@@ -135,6 +135,30 @@ else
 fi
 chown "$FOWN" "$STAMP"
 
+# ---------- 4a. Optional: uninstall apps from the site (UNINSTALL_APPS=lms,crm,...) ----------
+# Safe to leave set: an app that is not installed is skipped. `bench uninstall-app` takes a
+# backup of the site first (stored under sites/<site>/private/backups on the volume) and
+# deletes that app's DocTypes, data and custom fields. The app's code must still be in the
+# image when this runs; remove it from apps.json and rebuild the image only afterwards.
+# A failure is logged and never stops the site from starting.
+if [ -n "${UNINSTALL_APPS:-}" ]; then
+  installed_now="$(bench_ --site "$SITE_NAME" list-apps 2>/dev/null | awk '{print $1}')"
+  for app in ${UNINSTALL_APPS//,/ }; do
+    case "$app" in frappe|erpnext) log "Refusing to uninstall core app: $app"; continue ;; esac
+    if grep -qx "$app" <<<"$installed_now"; then
+      log "Uninstalling app from the site: $app (a backup is taken first)"
+      if bench_ --site "$SITE_NAME" uninstall-app "$app" --yes; then
+        log "Uninstalled app: $app"
+      else
+        log "WARNING: uninstalling $app failed; the site will start with it still installed"
+      fi
+    else
+      log "App $app is not installed on the site; nothing to uninstall"
+    fi
+  done
+  log "Apps installed now: $(bench_ --site "$SITE_NAME" list-apps 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+fi
+
 # ---------- 4b. One-time restore from a backup in the transfer bucket ----------
 # Runs only when RESTORE_ON_BOOT=1 and the marker file is absent. The marker is written
 # only after a fully successful restore, so a failed attempt is retried on the next boot.
