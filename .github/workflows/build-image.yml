@@ -1,8 +1,9 @@
 name: Build ERPNext v16 base image
 
-# Builds Frappe v16 + ERPNext + HRMS (same branches as the Oracle build, minus
-# crm / payments / lms / frappe_whatsapp) and pushes it to GHCR for linux/amd64.
+# Builds Frappe v16 + the apps listed in apps.json for linux/amd64 and pushes it to GHCR.
 # Railway then uses it as BASE_IMAGE for the wrapper in the repo-root Dockerfile.
+# The build FAILS if apps.json is missing/empty, and the :v16 tag is only moved after the
+# finished image has been checked to really contain the apps.
 
 on:
   workflow_dispatch:
@@ -24,7 +25,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Checkout this repo (apps.json)
         uses: actions/checkout@v4
@@ -34,6 +35,17 @@ jobs:
         with:
           repository: frappe/frappe_docker
           path: frappe_docker
+
+      - name: Validate apps.json (fail loudly if missing or empty)
+        run: |
+          test -s apps.json || { echo "::error::apps.json is missing or empty (file name is case-sensitive)"; ls -la; exit 1; }
+          python3 - <<'PY'
+          import json
+          apps = json.load(open("apps.json"))
+          assert isinstance(apps, list) and apps, "apps.json must be a non-empty JSON list"
+          for a in apps:
+              print("app:", a["url"], a["branch"])
+          PY
 
       - uses: docker/setup-buildx-action@v3
 
@@ -46,10 +58,12 @@ jobs:
       - name: Compute build inputs
         id: prep
         run: |
-          echo "apps_b64=$(base64 -w0 apps.json)" >> "$GITHUB_OUTPUT"
+          APPS_B64="$(base64 -w0 apps.json)"
+          [ -n "$APPS_B64" ] || { echo "::error::apps.json encoded to an empty string"; exit 1; }
+          echo "apps_b64=$APPS_B64" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ecolattice-erp" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      - name: Build and push (commit tag only)
         uses: docker/build-push-action@v6
         with:
           context: frappe_docker
@@ -65,7 +79,23 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
           tags: |
-            ${{ steps.prep.outputs.image }}:v16
             ${{ steps.prep.outputs.image }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify the image really contains every app in apps.json
+        run: |
+          IMG="${{ steps.prep.outputs.image }}:${{ github.sha }}"
+          docker pull "$IMG"
+          docker run --rm "$IMG" bash -c '
+            cd /home/frappe/frappe-bench
+            echo "apps.txt:"; cat sites/apps.txt; echo
+            env/bin/pip list 2>/dev/null | grep -iE "^(frappe|erpnext|hrms|crm|lms|payments|frappe-whatsapp|frappe_whatsapp) " || true
+            env/bin/python -c "import frappe, erpnext, hrms; print(\"OK frappe\", frappe.__version__, \"erpnext\", erpnext.__version__, \"hrms\", hrms.__version__)"
+          '
+
+      - name: Move the v16 tag to the verified image
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ steps.prep.outputs.image }}:v16" \
+            "${{ steps.prep.outputs.image }}:${{ github.sha }}"
