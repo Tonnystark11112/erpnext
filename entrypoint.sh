@@ -24,11 +24,25 @@ if [ "$(id -u)" != "0" ]; then
   log "Container must start as root to fix volume ownership. Set RAILWAY_RUN_UID=0."; exit 1
 fi
 
+# Some images (e.g. a custom frappe_docker build) have user "frappe" but no group named "frappe".
+# Create an alias group on the same gid so a group literally named "frappe" exists (nginx needs one).
+if ! getent group frappe >/dev/null 2>&1; then
+  log "No 'frappe' group found: creating an alias on gid $(id -g frappe)"
+  groupadd -o -g "$(id -g frappe)" frappe
+fi
+# Make sure bench and the venv tools are found whatever the image's PATH is.
+export PATH="/home/frappe/.local/bin:/home/frappe/frappe-bench/env/bin:$PATH"
+
+# Always chown by numeric uid:gid, whatever the image calls the frappe user's group.
+FOWN="$(id -u frappe):$(id -g frappe)"
+FGRP="$(id -gn frappe)"
+log "frappe user: uid:gid=$FOWN group=$FGRP"
+
 # ---------- 1. Volume layout ----------
 # Only the site folder lives on the volume. assets/ and apps.txt stay in the image,
 # so they are always in sync with the code (no re-sync needed).
 mkdir -p "$DATA/sites"
-find "$DATA" ! -user frappe -exec chown frappe:frappe {} +
+find "$DATA" ! -user frappe -exec chown "$FOWN" {} +
 
 # ---------- 2. common_site_config.json (regenerated every boot from env) ----------
 "$BENCH/env/bin/python" - <<'PY'
@@ -52,7 +66,7 @@ cfg.update({
 json.dump(cfg, open(path, "w"), indent=1)
 PY
 echo "$SITE_NAME" > "$SITES/currentsite.txt"
-chown frappe:frappe "$SITES/common_site_config.json" "$SITES/currentsite.txt"
+chown "$FOWN" "$SITES/common_site_config.json" "$SITES/currentsite.txt"
 
 # ---------- 3. Wait for MariaDB and Redis (private network, may be IPv6) ----------
 wait_for() {
@@ -93,7 +107,7 @@ if [ ! -f "$SITE_ON_VOLUME/site_config.json" ]; then
   mkdir -p "$SITE_ON_VOLUME"
   cp -a "$SITES/$SITE_NAME/." "$SITE_ON_VOLUME/"
   rm -rf "$SITES/$SITE_NAME"
-  chown -R frappe:frappe "$SITE_ON_VOLUME"
+  chown -R "$FOWN" "$SITE_ON_VOLUME"
   ln -s "$SITE_ON_VOLUME" "$SITES/$SITE_NAME"
   bench_ --site "$SITE_NAME" set-config host_name "https://$SITE_NAME"
   bench_ --site "$SITE_NAME" enable-scheduler
@@ -112,7 +126,7 @@ else
     echo "$CURRENT_VERSIONS" > "$STAMP"
   fi
 fi
-chown frappe:frappe "$STAMP"
+chown "$FOWN" "$STAMP"
 
 # ---------- 4b. One-time restore from a backup in the transfer bucket ----------
 # Runs only when RESTORE_ON_BOOT=1 and the marker file is absent. The marker is written
@@ -154,7 +168,7 @@ for key in keys:
     s3.download_file(bucket, key, dest)
     print(f"[entrypoint] Restore: downloaded {os.path.basename(key)}", flush=True)
 PY
-  chown -R frappe:frappe "$RDIR"
+  chown -R "$FOWN" "$RDIR"
 
   SQL="$(ls "$RDIR"/*.sql.gz 2>/dev/null | head -1 || true)"
   PUB="$(ls "$RDIR"/*-files.tar 2>/dev/null | grep -v -- '-private-files.tar' | head -1 || true)"
@@ -176,7 +190,7 @@ PY
   bench_ --site "$SITE_NAME" clear-cache
   bench_ --site "$SITE_NAME" enable-scheduler
 
-  touch "$RESTORE_MARKER"; chown frappe:frappe "$RESTORE_MARKER"
+  touch "$RESTORE_MARKER"; chown "$FOWN" "$RESTORE_MARKER"
   rm -rf "$RDIR"
   log "Restore: finished. Administrator now uses the password from the restored backup."
 fi
@@ -189,7 +203,7 @@ else
 fi
 
 # ---------- 6. nginx config, then hand over to supervisord ----------
-sed -e "s|__PORT__|$PORT|g" -e "s|__SITE__|$SITE_NAME|g" \
+sed -e "s|__PORT__|$PORT|g" -e "s|__SITE__|$SITE_NAME|g" -e "s|^user frappe;|user frappe ${FGRP};|" \
   /opt/railway/nginx.conf.template > /etc/nginx/frappe-railway.conf
 
 log "Starting supervisord (nginx :$PORT, gunicorn, socketio, scheduler, worker)"
